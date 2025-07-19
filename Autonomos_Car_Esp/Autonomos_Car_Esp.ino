@@ -22,67 +22,42 @@
 #include <WebServer.h>
 #include <EEPROM.h>
 
-#include "webpage.h"
+#include "conf.h"
+#include "app.h"
 
 // =========================================================
 // Constants and Definitions
 // =========================================================
-// Throttle stop/min value
-#define DAC_MIN_VALUE (255 * 0.8 / 3.3)
-
-// control pins
-#define PIN_THOTTLE 25
-#define PIN_BRAKES 27
-#define PIN_CAR_DIR 26
-
-// steering pins
-#define PIN_STEER_DIR 33  // Stepper DIR
-#define PIN_STEP 32       // Stepper STEP
-
-// EEPROM addresses
-#define EEPROM_SIZE 512
-#define EEPROM_INDICATOR_ADDR 0
-#define EEPROM_POSITION_ADDR 1
-#define EEPROM_INDICATOR_VALUE 0xA0
-
-// =========================================================
-// Enums for car direction and brakes
-// =========================================================
-// forward normally opened
-enum {
-  backward = 0,
-  forward
-};
-
-// brakes off normally opened
-enum {
-  brakes_on = 0,
-  brakes_off
-};
-
-// steering
-enum {
-  st_right = 0,
-  st_left
-};
+#define setSteerDir(dir) digitalWrite(PIN_STEER_DIR, (dir))
+#define setCarDir(dir) digitalWrite(PIN_CAR_DIR, (dir))
 
 // =========================================================
 // Global Variables
 // =========================================================
-// Const variables:
-const int max_steering_steps = 100;  // Limit to prevent oversteering
-const int braking_time = 100;        // ms
 
-int car_speed = DAC_MIN_VALUE;
-signed char current_position = 0;        // Track current step position
-int stepper_pulse_width = 3000;  // Pulse width in micro sec
-bool auto_home_flag = 0;
+int car_speed = DEFAULT_SPEED;            // Car speed in DAC value
+int stepper_pulse_width = DEFAULT_STEER;  // Pulse width in micro sec
+signed char current_position = 0;         // Track current step position
 
-// WIFI variables:
+#if GO_HOME_MODE == GO_HOME_MODE_AUTO
+bool auto_home_flag = 1;
+#else
+bool auto_home_flag = 0;  // Auto Go Home disabled by default
+#endif
+
+bool manual_home_flag = 0;
+
 String dir = "S";  //String to store app command state.
-const char* ssid = "Wifi Car";
-const char* password = "12345678";
 WebServer server(80);
+
+struct {
+  bool forward;
+  bool backward;
+  bool left;
+  bool right;
+  bool stop;
+} dir_flags;
+bool stopped_flag = true;
 
 // =========================================================
 // Forward declarations for functions used before definition
@@ -93,6 +68,7 @@ void goBack();
 void goLeft();
 void goRight();
 void stopRobot();
+void stepMotor();
 void setSpeed(int speed);
 void setSteer(int speed);
 void moveDirection(String dir);
@@ -112,14 +88,14 @@ void setup() {
 
   // Initialize EEPROM
   EEPROM.begin(EEPROM_SIZE);
-  
+
   // Check if position was saved from previous run
   if (EEPROM.read(EEPROM_INDICATOR_ADDR) == EEPROM_INDICATOR_VALUE) {
     // Restore position from EEPROM (8-bit signed value)
     signed char saved_position = EEPROM.read(EEPROM_POSITION_ADDR);
-    
+
     // Validate the restored position is within bounds
-    if (saved_position >= -max_steering_steps && saved_position <= max_steering_steps) {
+    if (saved_position >= -MAX_STEERING_STEPS && saved_position <= MAX_STEERING_STEPS) {
       current_position = saved_position;
       Serial.print("Restored position from EEPROM: ");
       Serial.println((int)current_position);
@@ -140,7 +116,7 @@ void setup() {
 
   // Connecting WiFi
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(ssid, password);
+  WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
 
   IPAddress myIP = WiFi.softAPIP();
   Serial.print("AP IP address: ");
@@ -165,7 +141,6 @@ void setup() {
 
       moveDirection();
 
-
     } else if (server.hasArg("autoHome")) {
 
       String autoHome = server.arg("autoHome");
@@ -175,8 +150,6 @@ void setup() {
         auto_home_flag = 1;
 
         Serial.println("Auto Go Home enabled");
-
-        goHome();
 
       } else {
 
@@ -191,8 +164,21 @@ void setup() {
 
       Serial.println("Manual Go Home triggered");
 
-      goHome();
+      //Check if Already at Home
+      if (current_position == 0) {
+        Serial.println("Already at Home");
+      } else {
+        manual_home_flag = 1;
+      }
 
+      server.send(200, "text/plain", "OK");
+
+    } else if (server.hasArg("resetPosition")) {
+      
+      Serial.println("Reset Position triggered");
+      
+      addToCurrentPosition(-current_position);  // Reset to zero
+      
       server.send(200, "text/plain", "OK");
 
     } else {
@@ -239,6 +225,30 @@ void setup() {
 // =========================================================
 void loop() {
   server.handleClient();
+  if (dir_flags.forward)
+    goAhead();
+
+  if (dir_flags.backward)
+    goBack();
+
+  if (dir_flags.stop)
+    stopRobot();
+
+  if (dir_flags.left)
+    goLeft();
+
+  if (dir_flags.right)
+    goRight();
+
+  if (!dir_flags.forward && !dir_flags.backward && !stopped_flag) {
+    stopRobot();
+    stopped_flag = true;
+  }
+
+  if (manual_home_flag || (!dir_flags.right && !dir_flags.left && current_position != 0 && auto_home_flag)) {
+    // If no steering direction is pressed, go home
+    goHome();
+  }
 }
 
 // =========================================================
@@ -252,155 +262,122 @@ void stepMotor() {
   delayMicroseconds(stepper_pulse_width);
 }
 
-void setDirection(bool dir) {
-  //Set direction
-  digitalWrite(PIN_STEER_DIR, dir);
-}
-
 void goAhead() {
-  //Release brakes
-  digitalWrite(PIN_BRAKES, brakes_off);
-  //Set direction
-  digitalWrite(PIN_CAR_DIR, forward);
   //apply throttle
   dacWrite(PIN_THOTTLE, car_speed);
+
+  Serial.print("Car moving forward with speed: ");
+  Serial.println(car_speed * 3.3 / 255.0); // Print speed in volts
 }
 
 void goBack() {
-  //Release brakes
-  digitalWrite(PIN_BRAKES, brakes_off);
-  //Set direction
-  digitalWrite(PIN_CAR_DIR, backward);
   //apply throttle
   dacWrite(PIN_THOTTLE, car_speed);
+
+  Serial.print("Car moving backward with speed: ");
+  Serial.println(car_speed * 3.3 / 255.0); // Print speed in volts
 }
 
 void goLeft() {
-  if (current_position < max_steering_steps) {
+  if (current_position < MAX_STEERING_STEPS) {
     stepMotor();
     addToCurrentPosition(1);
   }
 }
 
 void goRight() {
-  if (abs(current_position - 1) <= max_steering_steps) {
+  if (abs(current_position - 1) <= MAX_STEERING_STEPS) {
     stepMotor();
     addToCurrentPosition(-1);
   }
 }
 
 void goHome() {
-  //Check if Already at Home
-  if (current_position == 0) {
-    Serial.println("Already at Home");
-    return;
-  }
-
   // Set direction
-  setDirection(current_position > 0 ? st_right : st_left);
+  setSteerDir(current_position > 0 ? st_right : st_left);
 
-  while ((dir == "F" || dir == "B" || dir == "S") && current_position != 0) {
+  stepMotor();
+  
+  addToCurrentPosition(current_position > 0 ? -1 : 1);
 
-    stepMotor();
-    addToCurrentPosition(current_position > 0 ? -1 : 1);
-
-    if (current_position == 0)
-      Serial.println("Steering Reached Home");
-
-    server.handleClient();
+  if (current_position == 0){
+    manual_home_flag = 0;
+    Serial.println("Steering Reached Home");
   }
 }
 
 void stopRobot() {
-  // Release  throttle
+  // Release throttle
   dacWrite(PIN_THOTTLE, DAC_MIN_VALUE);
 
   // Activate brakes
-  digitalWrite(PIN_BRAKES, brakes_on);
+  // digitalWrite(PIN_BRAKES, brakes_on);
 
-  // Steering home
-  if (auto_home_flag) {
-    goHome();
-  }
+  Serial.println("Car stopped");
 }
 
 void moveDirection() {
   switch (dir[0]) {
+    case 'S':
+      {
+        switch (dir[1]) {
+          case 'L':
+            dir_flags.left = false;
+            break;
+          case 'R':
+            dir_flags.right = false;
+            break;
+          case 'F':
+            dir_flags.forward = false;
+            break;
+          case 'B':
+            dir_flags.backward = false;
+            break;
+          default:
+            dir_flags.stop = false;
+        }
+        break;
+      }
     case 'F':
       {
-        goAhead();
-        stopRobot();
-        goAhead();
+        if (!dir_flags.backward) {
+          stopped_flag = false;
+          setCarDir(forward);
+          dir_flags.forward = true;
+        }
         break;
       }
     case 'B':
       {
-        goBack();
-        stopRobot();
-        goBack();
-        break;
-      }
-    case 'S':
-      {
-        stopRobot();
+        if (!dir_flags.forward) {
+          stopped_flag = false;
+          setCarDir(backward);
+          dir_flags.backward = true;
+        }
         break;
       }
     case 'L':
       {
-        setDirection(st_left);
-        while (dir == "L") {
-          goLeft();
-          server.handleClient();
+        if (!dir_flags.right) {
+          manual_home_flag = 0;
+          dir_flags.left = true;
+          setSteerDir(st_left);
         }
         break;
       }
     case 'R':
       {
-        setDirection(st_right);
-        while (dir == "R") {
-          goRight();
-          server.handleClient();
+        if (!dir_flags.left) {
+          manual_home_flag = 0;
+          dir_flags.right = true;
+          setSteerDir(st_right);
         }
         break;
       }
-    case 'I':
+    default:
       {
-        goAhead();
-        setDirection(st_right);
-        while (dir == "I") {
-          goLeft();
-          server.handleClient();
-        }
-        break;
-      }
-    case 'G':
-      {
-        goAhead();
-        setDirection(st_left);
-        while (dir == "G") {
-          goRight();
-          server.handleClient();
-        }
-        break;
-      }
-    case 'J':
-      {
-        goBack();
-        setDirection(st_right);
-        while (dir == "J") {
-          goLeft();
-          server.handleClient();
-        }
-        break;
-      }
-    case 'H':
-      {
-        goBack();
-        setDirection(st_left);
-        while (dir == "H") {
-          goRight();
-          server.handleClient();
-        }
+        manual_home_flag = 0;
+        dir_flags.stop = true;
         break;
       }
   }
@@ -410,7 +387,7 @@ void setSpeed(int speed) {
   // map speed to min-255
   car_speed = map(speed, 0, 100, DAC_MIN_VALUE, 255);
   Serial.print("Car speed Volt: ");
-  Serial.println(car_speed);
+  Serial.println(speed * 3.3 / 100.0);
 }
 
 void setSteer(int speed) {
@@ -423,12 +400,11 @@ void setSteer(int speed) {
 void addToCurrentPosition(signed char val) {
   current_position = current_position + val;
 
-    
-    // Save position to EEPROM (only if within bounds)
+
+  // Save position to EEPROM (only if within bounds)
   EEPROM.write(EEPROM_POSITION_ADDR, (current_position & 0xFF));
   EEPROM.commit();
-  
+
   Serial.print("Position changed: ");
   Serial.println((int)current_position);
-
 }
